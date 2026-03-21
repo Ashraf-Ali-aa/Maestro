@@ -29,6 +29,7 @@ import { useShallow } from 'zustand/react/shallow';
 import { useGroupChatStore } from '../../stores/groupChatStore';
 import { getModalActions } from '../../stores/modalStore';
 import { SessionContextMenu } from './SessionContextMenu';
+import { SessionSecurityModal } from '../SessionSecurityModal';
 import { HamburgerMenuContent } from './HamburgerMenuContent';
 import { CollapsedSessionPill } from './CollapsedSessionPill';
 import { SidebarActions } from './SidebarActions';
@@ -130,6 +131,7 @@ function SessionListInner(props: SessionListProps) {
 		(s) => s.contextManagementSettings.contextWarningRedThreshold
 	);
 	const maestroCueEnabled = useSettingsStore((s) => s.encoreFeatures.maestroCue);
+	const llmGuardEnabled = useSettingsStore((s) => s.encoreFeatures.llmGuard);
 	const activeBatchSessionIds = useBatchStore(useShallow(selectActiveBatchSessionIds));
 
 	// Cue session status map: sessionId → { count, active } (only active when Encore Feature enabled)
@@ -306,12 +308,26 @@ function SessionListInner(props: SessionListProps) {
 	const menuRef = useRef<HTMLDivElement>(null);
 	const ignoreNextBlurRef = useRef(false);
 
+	// Session security modal state
+	const [securityModalSession, setSecurityModalSession] = useState<Session | null>(null);
+
 	// Toggle bookmark for a session - memoized to prevent SessionItem re-renders
 	const toggleBookmark = useCallback(
 		(sessionId: string) => {
 			setSessions((prev) =>
 				prev.map((s) => (s.id === sessionId ? { ...s, bookmarked: !s.bookmarked } : s))
 			);
+		},
+		[setSessions]
+	);
+
+	// Save session security policy
+	const handleSaveSecurityPolicy = useCallback(
+		(
+			sessionId: string,
+			securityPolicy: Partial<import('../../types').LlmGuardSettings> | undefined
+		) => {
+			setSessions((prev) => prev.map((s) => (s.id === sessionId ? { ...s, securityPolicy } : s)));
 		},
 		[setSessions]
 	);
@@ -416,6 +432,39 @@ function SessionListInner(props: SessionListProps) {
 	// when only branch data changes (we only need file counts here)
 	const { getFileCount } = useGitFileStatus();
 
+	// Cue subscription counts per session (only when Maestro Cue is enabled)
+	const [cueSessionMap, setCueSessionMap] = useState<Map<string, number>>(new Map());
+	useEffect(() => {
+		if (!maestroCueEnabled) {
+			setCueSessionMap(new Map());
+			return;
+		}
+		let cancelled = false;
+		const fetchCueStatus = async () => {
+			try {
+				const statuses = await window.maestro.cue.getStatus();
+				if (cancelled) return;
+				const map = new Map<string, number>();
+				for (const s of statuses) {
+					if (s.enabled && s.subscriptionCount > 0) {
+						map.set(s.sessionId, s.subscriptionCount);
+					}
+				}
+				setCueSessionMap(map);
+			} catch {
+				// Cue API may not be available
+			}
+		};
+		fetchCueStatus();
+		const unsubscribe = window.maestro.cue.onActivityUpdate(() => fetchCueStatus());
+		const interval = setInterval(fetchCueStatus, 30_000);
+		return () => {
+			cancelled = true;
+			unsubscribe();
+			clearInterval(interval);
+		};
+	}, [maestroCueEnabled]);
+
 	const {
 		sortedWorktreeChildrenByParentId,
 		sortedSessionIndexById,
@@ -430,6 +479,14 @@ function SessionListInner(props: SessionListProps) {
 		sortedFilteredSessions,
 		sortedGroups,
 	} = useSessionCategories(sessionFilter, sortedSessions, showUnreadAgentsOnly, activeSessionId);
+
+	const hasUnreadAgents = useMemo(
+		() =>
+			sessions.some(
+				(s) => !s.parentSessionId && (s.aiTabs?.some((tab) => tab.hasUnread) || s.state === 'busy')
+			),
+		[sessions]
+	);
 
 	// PERF: Cached callback maps to prevent SessionItem re-renders
 	// These Maps store stable function references keyed by session/editing ID
@@ -527,6 +584,7 @@ function SessionListInner(props: SessionListProps) {
 					jumpNumber={getSessionJumpNumber(session.id)}
 					cueSubscriptionCount={cueSessionMap.get(session.id)?.count}
 					cueActiveRun={cueSessionMap.get(session.id)?.active}
+					llmGuardEnabled={llmGuardEnabled}
 					onSelect={selectHandlers.get(session.id)!}
 					onDragStart={dragStartHandlers.get(session.id)!}
 					onDragOver={handleDragOver}
@@ -594,6 +652,7 @@ function SessionListInner(props: SessionListProps) {
 										jumpNumber={getSessionJumpNumber(child.id)}
 										cueSubscriptionCount={cueSessionMap.get(child.id)?.count}
 										cueActiveRun={cueSessionMap.get(child.id)?.active}
+										llmGuardEnabled={llmGuardEnabled}
 										onSelect={selectHandlers.get(child.id)!}
 										onDragStart={dragStartHandlers.get(child.id)!}
 										onContextMenu={contextMenuHandlers.get(child.id)!}
@@ -1270,6 +1329,7 @@ function SessionListInner(props: SessionListProps) {
 				hasNoSessions={sessions.length === 0}
 				shortcuts={shortcuts}
 				showUnreadAgentsOnly={showUnreadAgentsOnly}
+				hasUnreadAgents={hasUnreadAgents}
 				addNewSession={addNewSession}
 				openWizard={openWizard}
 				setLeftSidebarOpen={setLeftSidebarOpen}
@@ -1330,6 +1390,21 @@ function SessionListInner(props: SessionListProps) {
 							? () => onConfigureCue(contextMenuSession)
 							: undefined
 					}
+					onSecuritySettings={
+						llmGuardEnabled && contextMenuSession.toolType !== 'terminal'
+							? () => setSecurityModalSession(contextMenuSession)
+							: undefined
+					}
+				/>
+			)}
+
+			{/* Session Security Modal */}
+			{securityModalSession && (
+				<SessionSecurityModal
+					theme={theme}
+					session={securityModalSession}
+					onClose={() => setSecurityModalSession(null)}
+					onSave={handleSaveSecurityPolicy}
 				/>
 			)}
 		</div>
